@@ -2,16 +2,20 @@
 set -e
 
 # Configuration
-REGION="ap-south-2"
-VPC_ID="vpc-04d03167204de5c6e"
-SUBNET_ID="subnet-07ee64daf7f238f7a"
-AMI_ID="ami-010ae2e0c8834a9ac"
+# Region: "auto" picks the first region in REGION_PREFERENCE that is enabled,
+# offers INSTANCE_TYPE and has enough free On-Demand vCPU quota for the cluster.
+# Hyderabad (ap-south-2) is last on purpose: the SFU servers under test run there,
+# and load generators would eat the vCPU quota the SFU needs to scale out.
+REGION="${LOADTEST_REGION:-auto}"
+REGION_PREFERENCE="${LOADTEST_REGION_PREFERENCE:-ap-south-1 ap-southeast-1 ap-south-2}"
+SUBNET_ID="${LOADTEST_SUBNET_ID:-}"      # empty = auto-discover public subnets in REGION
 INSTANCE_TYPE="m6i.8xlarge"
 INSTANCE_COUNT=4
-KEY_NAME="sherymeet-loadtest-key"
 SG_NAME="sherymeet-loadtest-sg"
 REPO_URL="https://github.com/gouravrajak985/sherymeet-loadtest.git"
 INSTANCES_FILE="loadtest-instances.txt"
+REGION_FILE="loadtest-region.txt"        # region the current cluster was deployed to
+AMI_PARAM="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 
 # Colors
 RED='\033[0;31m'
@@ -36,6 +40,9 @@ Commands:
   cleanup             Terminate all instances and clean up resources
 
 Options:
+  -r, --region <name> AWS region, or "auto" (default: auto = nearest region with
+                      free vCPU quota, in order: $REGION_PREFERENCE)
+  -s, --subnet <id>   Public subnet to launch in (default: auto-discover)
   -n, --count <num>   Number of instances (default: 4)
   -t, --type <type>   Instance type (default: m6i.8xlarge)
   -p, --participants  Participants per instance (default: 200)
@@ -44,6 +51,7 @@ Options:
 
 Examples:
   $0 deploy
+  $0 deploy --region ap-south-1 --count 6
   $0 run https://sherymeet.pugly.in/meet/my-room
   $0 status
   $0 ssh 1
@@ -58,7 +66,127 @@ log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# Key pairs are per region, so the key (and its .pem) is named per region.
+set_region_vars() {
+    KEY_NAME="sherymeet-loadtest-key-$REGION"
+}
+
+# Region of the deployed cluster (status/run/ssh/logs/watch/cleanup)
+load_deployed_region() {
+    if [ -f "$REGION_FILE" ]; then
+        REGION=$(cat "$REGION_FILE")
+    elif [ "$REGION" = "auto" ]; then
+        REGION="ap-south-2"   # clusters deployed before regions were recorded
+    fi
+    set_region_vars
+}
+
+# Free standard On-Demand vCPU (A,C,D,H,I,M,R,T,Z families) in a region
+free_vcpus() {
+    local region="$1" quota types vmap used=0
+    quota=$(aws service-quotas get-service-quota --region "$region" --service-code ec2 \
+        --quota-code L-1216C47A --query 'Quota.Value' --output text 2>/dev/null) || return 1
+    types=$(aws ec2 describe-instances --region "$region" \
+        --filters "Name=instance-state-name,Values=pending,running" \
+        --query 'Reservations[].Instances[?InstanceLifecycle==`null`].InstanceType[]' --output json 2>/dev/null)
+    if [ "$(echo "$types" | jq 'length')" -gt 0 ]; then
+        # shellcheck disable=SC2046
+        vmap=$(aws ec2 describe-instance-types --region "$region" \
+            --instance-types $(echo "$types" | jq -r 'unique[]') \
+            --query 'InstanceTypes[].{t:InstanceType,v:VCpuInfo.DefaultVCpus}' --output json)
+        used=$(jq -n --argjson ts "$types" --argjson vm "$vmap" \
+            '($vm | map({(.t): .v}) | add) as $m | [$ts[] | select(test("^[acdhimrtz]")) | $m[.]] | add // 0')
+    fi
+    echo $(( ${quota%.*} - used ))
+}
+
+instance_vcpus() {
+    aws ec2 describe-instance-types --region "$1" --instance-types "$INSTANCE_TYPE" \
+        --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text 2>/dev/null
+}
+
+region_enabled() {
+    local s
+    s=$(aws ec2 describe-regions --all-regions --region us-east-1 \
+        --filters "Name=region-name,Values=$1" --query 'Regions[0].OptInStatus' --output text 2>/dev/null)
+    [ "$s" = "opt-in-not-required" ] || [ "$s" = "opted-in" ]
+}
+
+# Picks REGION (if "auto") and checks the cluster fits its vCPU quota
+choose_region() {
+    local per need free r
+    if [ "$REGION" != "auto" ]; then
+        region_enabled "$REGION" || { log_error "Region $REGION is not enabled for this account"; exit 1; }
+        per=$(instance_vcpus "$REGION")
+        [ -n "$per" ] && [ "$per" != "None" ] || { log_error "$INSTANCE_TYPE is not offered in $REGION"; exit 1; }
+        need=$(( per * INSTANCE_COUNT )); free=$(free_vcpus "$REGION")
+        if [ "$free" -lt "$need" ]; then
+            log_error "$REGION has $free vCPU free; $INSTANCE_COUNT x $INSTANCE_TYPE needs $need. Use --region auto, fewer --count, or a smaller --type."
+            exit 1
+        fi
+        log_success "Region $REGION: $free vCPU free, cluster needs $need"
+        set_region_vars
+        return
+    fi
+    log_info "Choosing region (preference: $REGION_PREFERENCE)..."
+    for r in $REGION_PREFERENCE; do
+        if ! region_enabled "$r"; then log_warn "$r: not enabled"; continue; fi
+        per=$(instance_vcpus "$r")
+        if [ -z "$per" ] || [ "$per" = "None" ]; then log_warn "$r: $INSTANCE_TYPE not offered"; continue; fi
+        need=$(( per * INSTANCE_COUNT )); free=$(free_vcpus "$r" || echo 0)
+        if [ "$free" -ge "$need" ]; then
+            REGION="$r"
+            log_success "Using $REGION: $free vCPU free, cluster needs $need"
+            set_region_vars
+            return
+        fi
+        log_warn "$r: only $free vCPU free, need $need"
+    done
+    log_error "No region in '$REGION_PREFERENCE' has $INSTANCE_COUNT x $INSTANCE_TYPE free. Lower --count or request a quota increase."
+    exit 1
+}
+
+# Finds public subnets (default route to an internet gateway + public IPs on
+# launch; the nodes need public IPs for SSH and outbound traffic). Picks the VPC
+# whose public subnets cover the most Availability Zones, so a capacity shortage
+# in one zone can fall back to another. Sets VPC_ID, SUBNET_ID, SUBNET_CANDIDATES.
+choose_subnet() {
+    if [ -n "$SUBNET_ID" ]; then
+        VPC_ID=$(aws ec2 describe-subnets --region "$REGION" --subnet-ids "$SUBNET_ID" \
+            --query 'Subnets[0].VpcId' --output text 2>/dev/null) \
+            || { log_error "Subnet $SUBNET_ID not found in $REGION"; exit 1; }
+        SUBNET_CANDIDATES="$SUBNET_ID"
+        log_success "Subnet $SUBNET_ID (VPC $VPC_ID)"
+        return
+    fi
+    local rts rows
+    rts=$(aws ec2 describe-route-tables --region "$REGION" --output json)
+    # Rows: free-IPs subnet vpc az name
+    rows=$(aws ec2 describe-subnets --region "$REGION" \
+        --filters "Name=map-public-ip-on-launch,Values=true" "Name=state,Values=available" --output json \
+      | jq -r --argjson rts "$rts" '
+          ($rts.RouteTables) as $t
+          | .Subnets[]
+          | . as $s
+          | ([$t[] | select(any(.Associations[]?; .SubnetId == $s.SubnetId))][0]
+             // [$t[] | select(.VpcId == $s.VpcId and any(.Associations[]?; .Main == true))][0]) as $rt
+          | select($rt != null and any($rt.Routes[]?; .DestinationCidrBlock == "0.0.0.0/0" and ((.GatewayId // "") | startswith("igw-"))))
+          | [.AvailableIpAddressCount, .SubnetId, .VpcId, .AvailabilityZone,
+             ((.Tags // []) | map(select(.Key == "Name").Value) | first // "-")] | @tsv')
+    [ -n "$rows" ] || { log_error "No public subnet (internet gateway route + public IPs) in $REGION. Pass --subnet <id>."; exit 1; }
+    # VPC with the most zones; tie-break on free IPs
+    VPC_ID=$(echo "$rows" | awk -F'\t' '{ k = $3 SUBSEP $4; if (!(k in seen)) { seen[k] = 1; az[$3]++ } ip[$3] += $1 }
+        END { for (v in az) printf "%d\t%d\t%s\n", az[v], ip[v], v }' | sort -k1,1nr -k2,2nr | head -1 | cut -f3)
+    # One subnet per zone (the one with the most free IPs), in zone order
+    SUBNET_CANDIDATES=$(echo "$rows" | awk -F'\t' -v v="$VPC_ID" '$3 == v' | sort -t$'\t' -k4,4 -k1,1nr \
+        | awk -F'\t' '!seen[$4]++ { print $2 }' | tr '\n' ' ')
+    SUBNET_ID="${SUBNET_CANDIDATES%% *}"
+    log_success "VPC $VPC_ID, public subnets in $(echo "$rows" | awk -F'\t' -v v="$VPC_ID" '$3 == v { print $4 }' | sort -u | tr '\n' ' ')"
+    log_info "Launch order (next zone is tried if one has no capacity): $SUBNET_CANDIDATES"
+}
+
 get_instance_ips() {
+    load_deployed_region
     if [ ! -f "$INSTANCES_FILE" ]; then
         log_error "No instances file found. Run 'deploy' first."
         exit 1
@@ -113,13 +241,24 @@ cmd_deploy() {
     echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
+    if [ -f "$INSTANCES_FILE" ]; then
+        log_error "A cluster is already deployed in $(cat "$REGION_FILE" 2>/dev/null || echo ap-south-2) ($INSTANCES_FILE). Run '$0 cleanup' first."
+        exit 1
+    fi
+
     # Prompt for meeting URL first
     prompt_meeting_url
 
     echo ""
+    choose_region
+    choose_subnet
+    AMI_ID=$(aws ssm get-parameter --region "$REGION" --name "$AMI_PARAM" --query Parameter.Value --output text)
+    log_success "AMI $AMI_ID (Amazon Linux 2023)"
+
+    echo ""
     echo -e "${YELLOW}Deployment Configuration:${NC}"
-    echo "  Region:           $REGION (Hyderabad)"
-    echo "  VPC:              $VPC_ID (my-vpc)"
+    echo "  Region:           $REGION"
+    echo "  VPC / Subnets:    $VPC_ID / $SUBNET_CANDIDATES"
     echo "  Instance Type:    $INSTANCE_TYPE"
     echo "  Instance Count:   $INSTANCE_COUNT"
     echo "  Participants:     ${PARTICIPANTS_PER_INSTANCE:-200} per instance ($((INSTANCE_COUNT * PARTICIPANTS_PER_INSTANCE)) total)"
@@ -251,22 +390,41 @@ echo "=== Setup complete ==="
 USERDATA
 )
 
-    # Launch instances
-    log_info "Launching $INSTANCE_COUNT instances..."
-    INSTANCE_IDS=$(aws ec2 run-instances \
-        --image-id "$AMI_ID" \
-        --instance-type "$INSTANCE_TYPE" \
-        --key-name "$KEY_NAME" \
-        --security-group-ids "$SG_ID" \
-        --subnet-id "$SUBNET_ID" \
-        --count "$INSTANCE_COUNT" \
-        --user-data "$USER_DATA" \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=sherymeet-loadtest},{Key=Project,Value=sherymeet-loadtest}]" \
-        --region "$REGION" \
-        --query 'Instances[*].InstanceId' \
-        --output text)
+    # Launch instances; if a zone has no capacity for the type, try the next zone
+    INSTANCE_IDS=""
+    for SN in $SUBNET_CANDIDATES; do
+        AZ=$(aws ec2 describe-subnets --region "$REGION" --subnet-ids "$SN" \
+            --query 'Subnets[0].AvailabilityZone' --output text)
+        log_info "Launching $INSTANCE_COUNT x $INSTANCE_TYPE in $AZ ($SN)..."
+        if OUT=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --instance-type "$INSTANCE_TYPE" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "$SG_ID" \
+            --subnet-id "$SN" \
+            --count "$INSTANCE_COUNT" \
+            --user-data "$USER_DATA" \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=sherymeet-loadtest},{Key=Project,Value=sherymeet-loadtest}]" \
+            --region "$REGION" \
+            --query 'Instances[*].InstanceId' \
+            --output text 2>&1); then
+            INSTANCE_IDS="$OUT"
+            SUBNET_ID="$SN"
+            break
+        elif echo "$OUT" | grep -qE "InsufficientInstanceCapacity|Unsupported"; then
+            log_warn "No $INSTANCE_TYPE capacity in $AZ right now; trying the next zone"
+        else
+            log_error "Launch failed: $OUT"
+            exit 1
+        fi
+    done
+    if [ -z "$INSTANCE_IDS" ]; then
+        log_error "No zone in $REGION had capacity for $INSTANCE_COUNT x $INSTANCE_TYPE. Try --region ap-southeast-1, a smaller --count, or another --type (e.g. c6i.8xlarge, m7i.8xlarge)."
+        exit 1
+    fi
 
     echo "$INSTANCE_IDS" > "$INSTANCES_FILE"
+    echo "$REGION" > "$REGION_FILE"
     log_success "Launched: $INSTANCE_IDS"
 
     # Wait for running
@@ -291,6 +449,7 @@ USERDATA
 }
 
 cmd_status() {
+    load_deployed_region
     if [ ! -f "$INSTANCES_FILE" ]; then
         log_error "No instances deployed. Run '$0 deploy' first."
         exit 1
@@ -299,7 +458,7 @@ cmd_status() {
     INSTANCE_IDS=$(cat "$INSTANCES_FILE")
 
     echo ""
-    echo -e "${BLUE}Instance Status:${NC}"
+    echo -e "${BLUE}Instance Status (${REGION}):${NC}"
     echo ""
 
     i=1
@@ -521,6 +680,9 @@ cmd_cleanup() {
     echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
+    load_deployed_region
+    echo "Region: $REGION"
+
     if [ -f "$INSTANCES_FILE" ]; then
         INSTANCE_IDS=$(cat "$INSTANCES_FILE")
         echo "Instances to terminate: $INSTANCE_IDS"
@@ -545,22 +707,24 @@ cmd_cleanup() {
         log_info "Waiting for termination..."
         aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS --region "$REGION" 2>/dev/null || true
 
-        rm "$INSTANCES_FILE"
+        rm -f "$INSTANCES_FILE" "$REGION_FILE"
         log_success "Instances terminated"
     fi
 
-    # Delete security group
-    log_info "Deleting security group..."
-    SG_ID=$(aws ec2 describe-security-groups \
-        --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
+    # Delete security groups (one per VPC the cluster was ever deployed to)
+    log_info "Deleting security groups..."
+    SG_IDS=$(aws ec2 describe-security-groups \
+        --filters "Name=group-name,Values=$SG_NAME" \
         --region "$REGION" \
-        --query 'SecurityGroups[0].GroupId' \
-        --output text 2>/dev/null || echo "None")
-
-    if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
-        aws ec2 delete-security-group --group-id "$SG_ID" --region "$REGION" 2>/dev/null || true
-        log_success "Security group deleted"
-    fi
+        --query 'SecurityGroups[].GroupId' \
+        --output text 2>/dev/null || echo "")
+    for SG_ID in $SG_IDS; do
+        if aws ec2 delete-security-group --group-id "$SG_ID" --region "$REGION" 2>/dev/null; then
+            log_success "Security group $SG_ID deleted"
+        else
+            log_warn "Could not delete $SG_ID (still in use?)"
+        fi
+    done
 
     # Key pair
     read -p "Delete key pair and .pem file? (y/n) " -n 1 -r
@@ -575,12 +739,21 @@ cmd_cleanup() {
     log_success "Cleanup complete"
 }
 
-# Parse options
+# Parse options (they may come before or after the command)
+ARGS=()
 PARTICIPANTS_PER_INSTANCE=200
 TEST_DURATION=10
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        -r|--region)
+            REGION="$2"
+            shift 2
+            ;;
+        -s|--subnet)
+            SUBNET_ID="$2"
+            shift 2
+            ;;
         -n|--count)
             INSTANCE_COUNT="$2"
             shift 2
@@ -601,13 +774,17 @@ while [[ $# -gt 0 ]]; do
             usage
             ;;
         deploy|run|status|ssh|logs|watch|cleanup)
-            COMMAND="$1"
+            if [ -z "${COMMAND:-}" ]; then COMMAND="$1"; else ARGS+=("$1"); fi
             shift
-            break
             ;;
-        *)
+        -*)
             log_error "Unknown option: $1"
             usage
+            ;;
+        *)
+            # positional argument for the command (meeting URL, instance number)
+            ARGS+=("$1")
+            shift
             ;;
     esac
 done
@@ -622,8 +799,6 @@ if ! [[ "$TEST_DURATION" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
-# Handle remaining args
-ARGS=("$@")
 
 case "${COMMAND:-}" in
     deploy)

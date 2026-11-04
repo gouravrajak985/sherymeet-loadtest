@@ -3,3 +3,9 @@ reports/
 .env
 fixtures/*
 !fixtures/.gitkeep
+
+# load test cluster: private SSH keys and local state
+*.pem
+loadtest-instances.txt
+loadtest-region.txt
+loadtest-node-*.log

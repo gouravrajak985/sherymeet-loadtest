@@ -100,6 +100,32 @@ docker compose run --rm worker run -c configs/scenario-a-basic.json \
   --meeting-url https://<host>/meet/<roomId> --confirm-production <host>
 ```
 
+## Running on an AWS cluster
+
+`loadtest-cluster.sh` launches several EC2 machines (default 4 × m6i.8xlarge, 200 browsers each) and runs
+the test on all of them at once.
+
+```bash
+./loadtest-cluster.sh deploy                          # pick a region, launch, set up (~5 min)
+./loadtest-cluster.sh status                          # wait until every node is "ready"
+./loadtest-cluster.sh run https://sherymeet.pugly.in/meet/<room>
+./loadtest-cluster.sh watch                           # live logs (another terminal)
+./loadtest-cluster.sh cleanup                         # terminate nodes, delete security group
+```
+
+**Region.** By default (`--region auto`) the script uses the first region in
+`ap-south-1 ap-southeast-1 ap-south-2` (Mumbai, Singapore, Hyderabad) that is enabled, offers the instance
+type and has enough free On-Demand vCPU quota for `count × vCPUs`. Hyderabad is last on purpose: the SFU
+servers under test run there, and load generators would use up the quota the SFU needs to scale out.
+Force a region with `--region ap-south-1`, or change the order with `LOADTEST_REGION_PREFERENCE`.
+
+**Network.** The script launches into a public subnet (default route to an internet gateway, public IPs on
+launch) that it finds in the chosen region. Pass `--subnet subnet-…` (or `LOADTEST_SUBNET_ID`) to choose one.
+
+The region of the running cluster is saved in `loadtest-region.txt`, so `status`, `run`, `ssh`, `logs` and
+`cleanup` use it automatically. The SSH key is per region (`sherymeet-loadtest-key-<region>.pem`) and is
+git-ignored. Options can go before or after the command, e.g. `deploy --count 6 --region ap-south-1`.
+
 ## Development
 
 ```bash
