@@ -1,0 +1,30 @@
+{
+  "name": "sherymeet-loadtest",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-based load testing for SheryMeet: real Chromium participants joining real meetings.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "loadtest": "tsx src/cli.ts",
+    "validate": "tsx src/cli.ts validate",
+    "run-test": "tsx src/cli.ts run",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run --exclude test/**/*.integration.test.ts",
+    "install-browser": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "1.64.1",
+    "tsx": "^4.23.15",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.7",
+    "vitest": "^5.1.0"
+  }
+}

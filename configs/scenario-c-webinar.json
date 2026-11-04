@@ -1,0 +1,21 @@
+{
+  "name": "Scenario C - anonymous webinar viewers",
+  "target": {
+    "meetingUrl": "https://YOUR-SHERYMEET-HOST/meet/ROOM_ID",
+    "environment": "production"
+  },
+  "participants": {
+    "total": 40,
+    "publishers": 0,
+    "subscribers": 40,
+    "cameraPublishers": 0,
+    "microphonePublishers": 0,
+    "interactiveSubscriberRatio": 0.3
+  },
+  "execution": {
+    "durationMinutes": 15,
+    "rampUpSeconds": 90,
+    "rampDownSeconds": 60,
+    "maxBrowsersPerWorker": 50
+  }
+}

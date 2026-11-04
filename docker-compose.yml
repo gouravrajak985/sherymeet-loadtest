@@ -1,0 +1,14 @@
+# One load-test worker. Example:
+#   docker compose run --rm worker run -c configs/scenario-a-basic.json \
+#     --meeting-url https://<host>/meet/<roomId> --confirm-production <host>
+services:
+  worker:
+    build: .
+    env_file: .env
+    # Chromium uses /dev/shm heavily; the 64 MB Docker default crashes renderers.
+    shm_size: "2gb"
+    init: true
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./fixtures:/app/fixtures:ro
+      - ./reports:/app/reports

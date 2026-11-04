@@ -1,0 +1,25 @@
+{
+  "name": "Scenario A - basic meeting (10)",
+  "target": {
+    "meetingUrl": "https://YOUR-SHERYMEET-HOST/meet/ROOM_ID",
+    "environment": "production"
+  },
+  "participants": {
+    "total": 10,
+    "publishers": 3,
+    "subscribers": 7,
+    "cameraPublishers": 2,
+    "microphonePublishers": 3,
+    "interactiveSubscriberRatio": 0.5
+  },
+  "execution": {
+    "durationMinutes": 5,
+    "rampUpSeconds": 30,
+    "rampDownSeconds": 15,
+    "maxBrowsersPerWorker": 15
+  },
+  "interactions": {
+    "chat": { "everySeconds": [30, 90] },
+    "raiseHand": { "probability": 0.5 }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "Scenario B - standard meeting (50)",
+  "target": {
+    "meetingUrl": "https://YOUR-SHERYMEET-HOST/meet/ROOM_ID",
+    "environment": "production"
+  },
+  "participants": {
+    "total": 50,
+    "publishers": 10,
+    "subscribers": 40,
+    "cameraPublishers": 5,
+    "microphonePublishers": 10
+  },
+  "execution": {
+    "durationMinutes": 10,
+    "rampUpSeconds": 120,
+    "rampDownSeconds": 60,
+    "maxBrowsersPerWorker": 50
+  }
+}
